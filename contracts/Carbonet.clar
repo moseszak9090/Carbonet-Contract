@@ -8,12 +8,21 @@
 (define-constant ERR-TRANSFER-FAILED (err u107))
 (define-constant ERR-UNAUTHORIZED-VERIFIER (err u108))
 (define-constant ERR-PROJECT-ALREADY-EXISTS (err u109))
+(define-constant ERR-AUCTION-NOT-FOUND (err u110))
+(define-constant ERR-AUCTION-EXPIRED (err u111))
+(define-constant ERR-AUCTION-NOT-EXPIRED (err u112))
+(define-constant ERR-BID-TOO-LOW (err u113))
+(define-constant ERR-AUCTION-ALREADY-FINALIZED (err u114))
+(define-constant ERR-NO-BIDS (err u115))
+(define-constant ERR-INVALID-DURATION (err u116))
+(define-constant ERR-AUCTION-ACTIVE (err u117))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-project-id uint u1)
 (define-data-var next-token-id uint u1)
 (define-data-var total-supply uint u0)
 (define-data-var total-retired uint u0)
+(define-data-var next-auction-id uint u1)
 
 (define-map authorized-verifiers principal bool)
 (define-map carbon-projects 
@@ -49,6 +58,36 @@
 (define-map user-total-balance principal uint)
 (define-map user-retired-balance principal uint)
 (define-map project-token-supply uint uint)
+
+(define-map carbon-auctions
+    uint
+    {
+        seller: principal,
+        project-id: uint,
+        amount: uint,
+        start-price: uint,
+        reserve-price: uint,
+        price-decrease-rate: uint,
+        start-block: uint,
+        duration-blocks: uint,
+        finalized: bool,
+        winner: (optional principal),
+        final-price: (optional uint),
+        active: bool
+    }
+)
+
+(define-map auction-bids
+    {auction-id: uint, bidder: principal}
+    {
+        amount: uint,
+        block-height: uint,
+        price-at-bid: uint
+    }
+)
+
+(define-map user-auction-count principal uint)
+(define-map auction-bid-count uint uint)
 
 (define-read-only (get-contract-owner)
     (var-get contract-owner)
@@ -209,10 +248,10 @@
     (let 
         (
             (user-balance (get-user-balance tx-sender project-id))
-            (user-total-balance (get-user-total-balance tx-sender))
-            (user-retired-balance (get-user-retired-balance tx-sender))
+            (current-user-total-balance (get-user-total-balance tx-sender))
+            (current-user-retired-balance (get-user-retired-balance tx-sender))
             (token-id (var-get next-token-id))
-            (current-block (stacks-block-height))
+            (current-block burn-block-height)
         )
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
         (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
@@ -227,8 +266,8 @@
         })
         
         (map-set user-balances {user: tx-sender, project-id: project-id} (- user-balance amount))
-        (map-set user-total-balance tx-sender (- user-total-balance amount))
-        (map-set user-retired-balance tx-sender (+ user-retired-balance amount))
+        (map-set user-total-balance tx-sender (- current-user-total-balance amount))
+        (map-set user-retired-balance tx-sender (+ current-user-retired-balance amount))
         (var-set next-token-id (+ token-id u1))
         (var-set total-supply (- (var-get total-supply) amount))
         (var-set total-retired (+ (var-get total-retired) amount))
@@ -282,5 +321,207 @@
             (project-data (unwrap! (map-get? carbon-projects project-id) ERR-PROJECT-NOT-FOUND))
         )
         (ok (* amount (get price-per-credit project-data)))
+    )
+)
+
+(define-read-only (get-auction-info (auction-id uint))
+    (map-get? carbon-auctions auction-id)
+)
+
+(define-read-only (get-auction-current-price (auction-id uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (blocks-elapsed (- burn-block-height (get start-block auction-data)))
+            (price-decrease (* blocks-elapsed (get price-decrease-rate auction-data)))
+            (current-price (- (get start-price auction-data) price-decrease))
+        )
+        (if (> current-price (get reserve-price auction-data))
+            (ok current-price)
+            (ok (get reserve-price auction-data))
+        )
+    )
+)
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+    (map-get? auction-bids {auction-id: auction-id, bidder: bidder})
+)
+
+(define-read-only (get-user-auction-count (user principal))
+    (default-to u0 (map-get? user-auction-count user))
+)
+
+(define-read-only (get-auction-bid-count (auction-id uint))
+    (default-to u0 (map-get? auction-bid-count auction-id))
+)
+
+(define-read-only (is-auction-expired (auction-id uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (end-block (+ (get start-block auction-data) (get duration-blocks auction-data)))
+        )
+        (ok (>= burn-block-height end-block))
+    )
+)
+
+(define-public (create-auction 
+    (project-id uint) 
+    (amount uint) 
+    (start-price uint) 
+    (reserve-price uint) 
+    (price-decrease-rate uint) 
+    (duration-blocks uint))
+    (let 
+        (
+            (auction-id (var-get next-auction-id))
+            (user-balance (get-user-balance tx-sender project-id))
+            (user-auction-count-current (get-user-auction-count tx-sender))
+        )
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> start-price u0) ERR-INVALID-AMOUNT)
+        (asserts! (> reserve-price u0) ERR-INVALID-AMOUNT)
+        (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
+        (asserts! (>= start-price reserve-price) ERR-INVALID-AMOUNT)
+        (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
+        
+        (map-set carbon-auctions auction-id {
+            seller: tx-sender,
+            project-id: project-id,
+            amount: amount,
+            start-price: start-price,
+            reserve-price: reserve-price,
+            price-decrease-rate: price-decrease-rate,
+            start-block: burn-block-height,
+            duration-blocks: duration-blocks,
+            finalized: false,
+            winner: none,
+            final-price: none,
+            active: true
+        })
+        
+        (map-set user-balances {user: tx-sender, project-id: project-id} (- user-balance amount))
+        (map-set user-total-balance tx-sender (- (get-user-total-balance tx-sender) amount))
+        (map-set user-auction-count tx-sender (+ user-auction-count-current u1))
+        (var-set next-auction-id (+ auction-id u1))
+        (ok auction-id)
+    )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (current-price (unwrap! (get-auction-current-price auction-id) ERR-AUCTION-NOT-FOUND))
+            (is-expired (unwrap! (is-auction-expired auction-id) ERR-AUCTION-NOT-FOUND))
+            (existing-bid (map-get? auction-bids {auction-id: auction-id, bidder: tx-sender}))
+            (current-bid-count (get-auction-bid-count auction-id))
+        )
+        (asserts! (get active auction-data) ERR-AUCTION-NOT-FOUND)
+        (asserts! (not (get finalized auction-data)) ERR-AUCTION-ALREADY-FINALIZED)
+        (asserts! (not is-expired) ERR-AUCTION-EXPIRED)
+        (asserts! (>= bid-amount current-price) ERR-BID-TOO-LOW)
+        (asserts! (not (is-eq tx-sender (get seller auction-data))) ERR-NOT-AUTHORIZED)
+        
+        (match existing-bid
+            prev-bid 
+                (map-set auction-bids {auction-id: auction-id, bidder: tx-sender} {
+                    amount: bid-amount,
+                    block-height: burn-block-height,
+                    price-at-bid: current-price
+                })
+            (begin
+                (map-set auction-bids {auction-id: auction-id, bidder: tx-sender} {
+                    amount: bid-amount,
+                    block-height: burn-block-height,
+                    price-at-bid: current-price
+                })
+                (map-set auction-bid-count auction-id (+ current-bid-count u1))
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (finalize-auction (auction-id uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (is-expired (unwrap! (is-auction-expired auction-id) ERR-AUCTION-NOT-FOUND))
+            (current-price (unwrap! (get-auction-current-price auction-id) ERR-AUCTION-NOT-FOUND))
+            (bid-count (get-auction-bid-count auction-id))
+        )
+        (asserts! (get active auction-data) ERR-AUCTION-NOT-FOUND)
+        (asserts! (not (get finalized auction-data)) ERR-AUCTION-ALREADY-FINALIZED)
+        (asserts! is-expired ERR-AUCTION-NOT-EXPIRED)
+        
+        (if (> bid-count u0)
+            (begin
+                (map-set carbon-auctions auction-id (merge auction-data {
+                    finalized: true,
+                    winner: (some tx-sender),
+                    final-price: (some current-price),
+                    active: false
+                }))
+                (settle-auction-transfer auction-id tx-sender current-price)
+            )
+            (begin
+                (map-set carbon-auctions auction-id (merge auction-data {
+                    finalized: true,
+                    active: false
+                }))
+                (return-auction-credits auction-id)
+            )
+        )
+    )
+)
+
+(define-public (cancel-auction (auction-id uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (bid-count (get-auction-bid-count auction-id))
+        )
+        (asserts! (is-eq tx-sender (get seller auction-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (get active auction-data) ERR-AUCTION-NOT-FOUND)
+        (asserts! (not (get finalized auction-data)) ERR-AUCTION-ALREADY-FINALIZED)
+        (asserts! (is-eq bid-count u0) ERR-AUCTION-ACTIVE)
+        
+        (map-set carbon-auctions auction-id (merge auction-data {
+            active: false,
+            finalized: true
+        }))
+        (return-auction-credits auction-id)
+    )
+)
+
+(define-private (settle-auction-transfer (auction-id uint) (winner principal) (final-price uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (project-id (get project-id auction-data))
+            (amount (get amount auction-data))
+            (winner-balance (get-user-balance winner project-id))
+            (winner-total-balance (get-user-total-balance winner))
+        )
+        (map-set user-balances {user: winner, project-id: project-id} (+ winner-balance amount))
+        (map-set user-total-balance winner (+ winner-total-balance amount))
+        (ok true)
+    )
+)
+
+(define-private (return-auction-credits (auction-id uint))
+    (let 
+        (
+            (auction-data (unwrap! (map-get? carbon-auctions auction-id) ERR-AUCTION-NOT-FOUND))
+            (seller (get seller auction-data))
+            (project-id (get project-id auction-data))
+            (amount (get amount auction-data))
+            (seller-balance (get-user-balance seller project-id))
+            (seller-total-balance (get-user-total-balance seller))
+        )
+        (map-set user-balances {user: seller, project-id: project-id} (+ seller-balance amount))
+        (map-set user-total-balance seller (+ seller-total-balance amount))
+        (ok true)
     )
 )
