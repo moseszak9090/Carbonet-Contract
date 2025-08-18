@@ -16,6 +16,13 @@
 (define-constant ERR-NO-BIDS (err u115))
 (define-constant ERR-INVALID-DURATION (err u116))
 (define-constant ERR-AUCTION-ACTIVE (err u117))
+(define-constant ERR-STAKING-POOL-NOT-FOUND (err u118))
+(define-constant ERR-STAKING-POOL-EXISTS (err u119))
+(define-constant ERR-NO-STAKE-FOUND (err u120))
+(define-constant ERR-STAKE-LOCKED (err u121))
+(define-constant ERR-INSUFFICIENT-STAKED (err u122))
+(define-constant ERR-INVALID-LOCK-PERIOD (err u123))
+(define-constant ERR-NO-REWARDS (err u124))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-project-id uint u1)
@@ -88,6 +95,51 @@
 
 (define-map user-auction-count principal uint)
 (define-map auction-bid-count uint uint)
+
+(define-map staking-pools
+    uint
+    {
+        project-id: uint,
+        total-staked: uint,
+        annual-yield-rate: uint,
+        min-lock-blocks: uint,
+        max-lock-blocks: uint,
+        total-rewards-distributed: uint,
+        pool-creator: principal,
+        active: bool
+    }
+)
+
+(define-map user-stakes
+    {user: principal, project-id: uint}
+    {
+        amount: uint,
+        stake-start-block: uint,
+        lock-end-block: uint,
+        last-reward-block: uint,
+        total-rewards-earned: uint,
+        early-unstake-penalty: uint
+    }
+)
+
+(define-map staking-pool-stats 
+    uint
+    {
+        total-stakers: uint,
+        average-lock-period: uint,
+        pool-created-block: uint
+    }
+)
+
+(define-map user-staking-summary
+    principal
+    {
+        total-staked-amount: uint,
+        active-stakes-count: uint,
+        total-rewards-earned: uint,
+        total-penalties-paid: uint
+    }
+)
 
 (define-read-only (get-contract-owner)
     (var-get contract-owner)
@@ -525,3 +577,252 @@
         (ok true)
     )
 )
+
+(define-read-only (get-staking-pool-info (project-id uint))
+    (map-get? staking-pools project-id)
+)
+
+(define-read-only (get-user-stake-info (user principal) (project-id uint))
+    (map-get? user-stakes {user: user, project-id: project-id})
+)
+
+(define-read-only (get-staking-pool-stats (project-id uint))
+    (map-get? staking-pool-stats project-id)
+)
+
+(define-read-only (get-user-staking-summary (user principal))
+    (default-to 
+        {
+            total-staked-amount: u0,
+            active-stakes-count: u0,
+            total-rewards-earned: u0,
+            total-penalties-paid: u0
+        }
+        (map-get? user-staking-summary user)
+    )
+)
+
+(define-read-only (calculate-staking-rewards (user principal) (project-id uint))
+    (let 
+        (
+            (stake-info (unwrap! (map-get? user-stakes {user: user, project-id: project-id}) ERR-NO-STAKE-FOUND))
+            (pool-info (unwrap! (map-get? staking-pools project-id) ERR-STAKING-POOL-NOT-FOUND))
+            (blocks-staked (- burn-block-height (get last-reward-block stake-info)))
+            (annual-blocks u52560)
+            (yield-rate (get annual-yield-rate pool-info))
+            (staked-amount (get amount stake-info))
+        )
+        (if (> blocks-staked u0)
+            (ok (/ (* (* staked-amount yield-rate) blocks-staked) (* annual-blocks u100)))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (is-stake-unlocked (user principal) (project-id uint))
+    (let 
+        (
+            (stake-info (unwrap! (map-get? user-stakes {user: user, project-id: project-id}) ERR-NO-STAKE-FOUND))
+        )
+        (ok (>= burn-block-height (get lock-end-block stake-info)))
+    )
+)
+
+(define-public (create-staking-pool 
+    (project-id uint) 
+    (annual-yield-rate uint) 
+    (min-lock-blocks uint) 
+    (max-lock-blocks uint))
+    (let 
+        (
+            (project-data (unwrap! (map-get? carbon-projects project-id) ERR-PROJECT-NOT-FOUND))
+            (existing-pool (map-get? staking-pools project-id))
+        )
+        (asserts! (is-eq tx-sender (get developer project-data)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none existing-pool) ERR-STAKING-POOL-EXISTS)
+        (asserts! (> annual-yield-rate u0) ERR-INVALID-AMOUNT)
+        (asserts! (> min-lock-blocks u0) ERR-INVALID-LOCK-PERIOD)
+        (asserts! (>= max-lock-blocks min-lock-blocks) ERR-INVALID-LOCK-PERIOD)
+        
+        (map-set staking-pools project-id {
+            project-id: project-id,
+            total-staked: u0,
+            annual-yield-rate: annual-yield-rate,
+            min-lock-blocks: min-lock-blocks,
+            max-lock-blocks: max-lock-blocks,
+            total-rewards-distributed: u0,
+            pool-creator: tx-sender,
+            active: true
+        })
+        
+        (map-set staking-pool-stats project-id {
+            total-stakers: u0,
+            average-lock-period: u0,
+            pool-created-block: burn-block-height
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (stake-carbon-credits (project-id uint) (amount uint) (lock-blocks uint))
+    (let 
+        (
+            (pool-info (unwrap! (map-get? staking-pools project-id) ERR-STAKING-POOL-NOT-FOUND))
+            (user-balance (get-user-balance tx-sender project-id))
+            (existing-stake (map-get? user-stakes {user: tx-sender, project-id: project-id}))
+            (user-summary (get-user-staking-summary tx-sender))
+            (pool-stats (unwrap! (map-get? staking-pool-stats project-id) ERR-STAKING-POOL-NOT-FOUND))
+        )
+        (asserts! (get active pool-info) ERR-STAKING-POOL-NOT-FOUND)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
+        (asserts! (>= lock-blocks (get min-lock-blocks pool-info)) ERR-INVALID-LOCK-PERIOD)
+        (asserts! (<= lock-blocks (get max-lock-blocks pool-info)) ERR-INVALID-LOCK-PERIOD)
+        (asserts! (is-none existing-stake) ERR-NOT-AUTHORIZED)
+        
+        (map-set user-stakes {user: tx-sender, project-id: project-id} {
+            amount: amount,
+            stake-start-block: burn-block-height,
+            lock-end-block: (+ burn-block-height lock-blocks),
+            last-reward-block: burn-block-height,
+            total-rewards-earned: u0,
+            early-unstake-penalty: (/ amount u10)
+        })
+        
+        (map-set staking-pools project-id (merge pool-info {
+            total-staked: (+ (get total-staked pool-info) amount)
+        }))
+        
+        (map-set staking-pool-stats project-id (merge pool-stats {
+            total-stakers: (+ (get total-stakers pool-stats) u1),
+            average-lock-period: (/ (+ (* (get average-lock-period pool-stats) (get total-stakers pool-stats)) lock-blocks) (+ (get total-stakers pool-stats) u1))
+        }))
+        
+        (map-set user-staking-summary tx-sender (merge user-summary {
+            total-staked-amount: (+ (get total-staked-amount user-summary) amount),
+            active-stakes-count: (+ (get active-stakes-count user-summary) u1)
+        }))
+        
+        (map-set user-balances {user: tx-sender, project-id: project-id} (- user-balance amount))
+        (map-set user-total-balance tx-sender (- (get-user-total-balance tx-sender) amount))
+        (ok true)
+    )
+)
+
+(define-public (claim-staking-rewards (project-id uint))
+    (let 
+        (
+            (stake-info (unwrap! (map-get? user-stakes {user: tx-sender, project-id: project-id}) ERR-NO-STAKE-FOUND))
+            (pool-info (unwrap! (map-get? staking-pools project-id) ERR-STAKING-POOL-NOT-FOUND))
+            (pending-rewards (unwrap! (calculate-staking-rewards tx-sender project-id) ERR-NO-REWARDS))
+            (user-summary (get-user-staking-summary tx-sender))
+            (user-balance (get-user-balance tx-sender project-id))
+        )
+        (asserts! (> pending-rewards u0) ERR-NO-REWARDS)
+        
+        (map-set user-stakes {user: tx-sender, project-id: project-id} (merge stake-info {
+            last-reward-block: burn-block-height,
+            total-rewards-earned: (+ (get total-rewards-earned stake-info) pending-rewards)
+        }))
+        
+        (map-set staking-pools project-id (merge pool-info {
+            total-rewards-distributed: (+ (get total-rewards-distributed pool-info) pending-rewards)
+        }))
+        
+        (map-set user-staking-summary tx-sender (merge user-summary {
+            total-rewards-earned: (+ (get total-rewards-earned user-summary) pending-rewards)
+        }))
+        
+        (map-set user-balances {user: tx-sender, project-id: project-id} (+ user-balance pending-rewards))
+        (map-set user-total-balance tx-sender (+ (get-user-total-balance tx-sender) pending-rewards))
+        (var-set total-supply (+ (var-get total-supply) pending-rewards))
+        (ok pending-rewards)
+    )
+)
+
+(define-public (unstake-carbon-credits (project-id uint))
+    (let 
+        (
+            (stake-info (unwrap! (map-get? user-stakes {user: tx-sender, project-id: project-id}) ERR-NO-STAKE-FOUND))
+            (pool-info (unwrap! (map-get? staking-pools project-id) ERR-STAKING-POOL-NOT-FOUND))
+            (is-unlocked (unwrap! (is-stake-unlocked tx-sender project-id) ERR-STAKE-LOCKED))
+            (staked-amount (get amount stake-info))
+            (user-balance (get-user-balance tx-sender project-id))
+            (user-summary (get-user-staking-summary tx-sender))
+            (pool-stats (unwrap! (map-get? staking-pool-stats project-id) ERR-STAKING-POOL-NOT-FOUND))
+        )
+        (asserts! is-unlocked ERR-STAKE-LOCKED)
+        
+        (map-delete user-stakes {user: tx-sender, project-id: project-id})
+        
+        (map-set staking-pools project-id (merge pool-info {
+            total-staked: (- (get total-staked pool-info) staked-amount)
+        }))
+        
+        (map-set staking-pool-stats project-id (merge pool-stats {
+            total-stakers: (- (get total-stakers pool-stats) u1)
+        }))
+        
+        (map-set user-staking-summary tx-sender (merge user-summary {
+            total-staked-amount: (- (get total-staked-amount user-summary) staked-amount),
+            active-stakes-count: (- (get active-stakes-count user-summary) u1)
+        }))
+        
+        (map-set user-balances {user: tx-sender, project-id: project-id} (+ user-balance staked-amount))
+        (map-set user-total-balance tx-sender (+ (get-user-total-balance tx-sender) staked-amount))
+        (ok staked-amount)
+    )
+)
+
+(define-public (emergency-unstake (project-id uint))
+    (let 
+        (
+            (stake-info (unwrap! (map-get? user-stakes {user: tx-sender, project-id: project-id}) ERR-NO-STAKE-FOUND))
+            (pool-info (unwrap! (map-get? staking-pools project-id) ERR-STAKING-POOL-NOT-FOUND))
+            (staked-amount (get amount stake-info))
+            (penalty-amount (get early-unstake-penalty stake-info))
+            (return-amount (- staked-amount penalty-amount))
+            (user-balance (get-user-balance tx-sender project-id))
+            (user-summary (get-user-staking-summary tx-sender))
+            (pool-stats (unwrap! (map-get? staking-pool-stats project-id) ERR-STAKING-POOL-NOT-FOUND))
+        )
+        (asserts! (< burn-block-height (get lock-end-block stake-info)) ERR-NOT-AUTHORIZED)
+        
+        (map-delete user-stakes {user: tx-sender, project-id: project-id})
+        
+        (map-set staking-pools project-id (merge pool-info {
+            total-staked: (- (get total-staked pool-info) staked-amount)
+        }))
+        
+        (map-set staking-pool-stats project-id (merge pool-stats {
+            total-stakers: (- (get total-stakers pool-stats) u1)
+        }))
+        
+        (map-set user-staking-summary tx-sender (merge user-summary {
+            total-staked-amount: (- (get total-staked-amount user-summary) staked-amount),
+            active-stakes-count: (- (get active-stakes-count user-summary) u1),
+            total-penalties-paid: (+ (get total-penalties-paid user-summary) penalty-amount)
+        }))
+        
+        (map-set user-balances {user: tx-sender, project-id: project-id} (+ user-balance return-amount))
+        (map-set user-total-balance tx-sender (+ (get-user-total-balance tx-sender) return-amount))
+        (var-set total-supply (- (var-get total-supply) penalty-amount))
+        (ok return-amount)
+    )
+)
+
+(define-public (deactivate-staking-pool (project-id uint))
+    (let 
+        (
+            (pool-info (unwrap! (map-get? staking-pools project-id) ERR-STAKING-POOL-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender (get pool-creator pool-info)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get total-staked pool-info) u0) ERR-NOT-AUTHORIZED)
+        
+        (map-set staking-pools project-id (merge pool-info {active: false}))
+        (ok true)
+    )
+)
+
+
